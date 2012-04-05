@@ -2,8 +2,8 @@
   (use srfi-1)
   (use srfi-13)
   (use gauche.net)
-  (use gauche.selector)
   (use gauche.parameter)
+  (use gauche.threads)
   (export
     <pseudo-irc-server>
     <pseudo-irc-server-client>
@@ -43,8 +43,6 @@
    (callbacks   :init-thunk make-hash-table)
 
    (server-socket)
-   (selector)
-
    (name    :init-value "pseudo-irc-server/gauche" :init-keyword :name)
    (version :init-value 0.01)))
 
@@ -81,50 +79,47 @@
 
 ;; 疑似IRCサーバを開始
 (define-method irc-server-start ((self <pseudo-irc-server>))
-  (let ((selector      (make <selector>))
-        (server-socket (make-server-socket (slot-ref self 'listen-port) :reuse-addr? #t)))
-    (slot-set! self 'selector      selector)
+  (let ((server-socket (make-server-socket (slot-ref self 'listen-port) :reuse-addr? #t)))
     (slot-set! self 'server-socket server-socket)
-    (selector-add!
-      selector
-      (socket-fd server-socket)
-      (pa$ pseudo-irc-server-accept-handler self) '(r))
 
     (log-info #`"Pseudo IRC server is running port ,(slot-ref self 'listen-port)...")
 
     (do () (#f)
-      (selector-select selector '(5 0)))))
+      (pseudo-irc-server-accept-handler self))))
 
 (define-method irc-server-start ()
   (irc-server-start (current-irc-server)))
 
 ;; クライアントの接続
-(define-method pseudo-irc-server-accept-handler ((self <pseudo-irc-server>) sock flag)
+(define-method pseudo-irc-server-accept-handler ((self <pseudo-irc-server>))
   (let* ((client-socket (socket-accept (slot-ref self 'server-socket)))
-         (client        (make <pseudo-irc-server-client> :socket client-socket)))
+         (client (make <pseudo-irc-server-client> :socket client-socket)))
     (log-info #`"Client ,client has connected.")
 
     (slot-push! self 'clients client)
-    (selector-add!
-      (slot-ref self 'selector)
-      (socket-input-port client-socket :buffering :none)
-      (pa$ pseudo-irc-server-client-input-handler self client)
-      '(r))))
+    (let* ((p (socket-input-port client-socket :buffering :none))
+           (client-thread
+            (make-thread
+             (^[]
+               (while
+                   (pseudo-irc-server-client-input-handler self client p))))))
+      (thread-start! client-thread))))
 
 ;; クライアントからの入力
-(define-method pseudo-irc-server-client-input-handler ((self <pseudo-irc-server>) (client <pseudo-irc-server-client>) (port <port>) flag)
+(define-method pseudo-irc-server-client-input-handler ((self <pseudo-irc-server>) (client <pseudo-irc-server-client>) (port <port>))
   (or
-    (and-let*
-        (( (not (port-closed? port)) )
-         (line (guard (e (else #f)) (read-line port)))
-         ( (not (eof-object? line)) )
-         (irc-message (parse-irc-message line)))
-      (pseudo-irc-server-handle-callback self client irc-message))
-    (begin
-      (log-info #`",client has disconnected.")
-      (slot-delete! self 'clients client)
-      (selector-delete! (slot-ref self 'selector) port #f #f)
-      (socket-close (slot-ref client 'socket)))))
+   (and-let*
+       (((not (port-closed? port)))
+        (line (guard (e (else #f)) (read-line port)))
+        ((not (eof-object? line)))
+        (irc-message (parse-irc-message line)))
+     (pseudo-irc-server-handle-callback self client irc-message)
+     #t)
+   (begin
+     (log-info #`",client has disconnected.")
+     (slot-delete! self 'clients client)
+     (socket-close (slot-ref client 'socket))
+     #f)))
 
 ;; IRCコマンドに対応するコールバック関数を呼ぶ
 (define-method pseudo-irc-server-handle-callback ((self <pseudo-irc-server>) (client <pseudo-irc-server-client>) (message <irc-message>))
@@ -329,7 +324,6 @@
 ;; QUIT
 (define-method quit-server ((server <pseudo-irc-server>) (client <pseudo-irc-server-client>) (message <irc-message>))
   (slot-delete! server 'clients client)
-  (selector-delete! (slot-ref server 'selector) (socket-input-port (slot-ref client 'socket)) #f #f)
   (socket-close (slot-ref client 'socket)))
 
 ;; EVAL
